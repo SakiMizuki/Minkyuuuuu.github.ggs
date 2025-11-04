@@ -20,11 +20,13 @@ const requiredEnv = (name: string): string => {
   return value
 }
 
+const REGION_ENV_PREFERENCE = ["AWS_S3_REGION", "S3_BUCKET_REGION", "AWS_DEFAULT_REGION", "AWS_REGION"] as const
+
 export function getS3Config(): S3Config {
   if (cachedConfig) return cachedConfig
 
   cachedConfig = {
-    region: requiredEnv("AWS_REGION"),
+    region: resolveRegion(),
     bucket: requiredEnv("S3_BUCKET_NAME"),
     accessKeyId: requiredEnv("AWS_ACCESS_KEY_ID"),
     secretAccessKey: requiredEnv("AWS_SECRET_ACCESS_KEY"),
@@ -65,3 +67,24 @@ export function getPublicFileUrl(key: string): string {
 }
 
 export const FILES_PREFIX = "files/"
+
+function resolveRegion(): string {
+  for (const name of REGION_ENV_PREFERENCE) {
+    const raw = process.env[name]
+    if (!raw) continue
+
+    const candidate = raw.trim()
+    if (!candidate) continue
+
+    if (isValidAwsRegion(candidate)) {
+      return candidate.toLowerCase()
+    }
+  }
+
+  const preferenceList = REGION_ENV_PREFERENCE.join(", ")
+  throw new Error(`Missing a valid AWS region. Provide one of: ${preferenceList}. Example: "ap-southeast-1".`)
+}
+
+function isValidAwsRegion(value: string): boolean {
+  return /^[a-z]{2}(?:-[a-z0-9]+)+-\d+$/i.test(value)
+}

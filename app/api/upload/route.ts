@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3"
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
-import { randomUUID } from "crypto"
+import { createHash, randomUUID } from "crypto"
 import { extname } from "path"
 import { computeExpiry, isAutoDeleteOption, type AutoDeleteOption } from "@/lib/auto-delete"
 import { FILES_PREFIX, getPublicFileUrl, getS3Client, getS3Config } from "@/lib/s3"
@@ -13,6 +13,7 @@ type FilenameMode = "original" | "random"
 
 const MAX_FILENAME_LENGTH = 200
 const DEFAULT_FILENAME_MODE: FilenameMode = "random"
+const PRESIGNED_HTTP_METHOD = "PUT" as const
 const UPLOAD_URL_TTL_SECONDS = 60 * 60 // 1 hour
 
 export async function POST(request: NextRequest) {
@@ -28,51 +29,62 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid auto-delete option." }, { status: 400 })
     }
 
-    const autoDeleteOption: AutoDeleteOption = autoDelete
-    const filenameMode = resolveFilenameMode(filenameModeRaw)
+      const autoDeleteOption: AutoDeleteOption = autoDelete
+      const filenameMode = resolveFilenameMode(filenameModeRaw)
 
-    const s3Client = getS3Client()
-    const { bucket } = getS3Config()
+      const s3Client = getS3Client()
+      const { bucket, region: s3Region } = getS3Config()
 
-    const extension = extractExtension(fileName)
-    const sharePath = await determineSharePath({
-      filenameMode,
-      originalName: fileName,
-      extension,
-      s3Client,
-      bucket,
-    })
-    const key = `${FILES_PREFIX}${sharePath}`
+      await ensureS3ClientRegion(s3Client, s3Region)
 
-    const now = new Date()
-    const expiresAtDate = computeExpiry(autoDeleteOption, now)
+      const extension = extractExtension(fileName)
+      const sharePath = await determineSharePath({
+        filenameMode,
+        originalName: fileName,
+        extension,
+        s3Client,
+        bucket,
+      })
+      const key = `${FILES_PREFIX}${sharePath}`
 
-    const contentType = resolveContentType(fileType)
-    const metadata = buildObjectMetadata({
-      autoDeleteOption,
-      expiresAtDate,
-      now,
-      filenameMode,
-      originalFilename: fileName,
-    })
+      const now = new Date()
+      const expiresAtDate = computeExpiry(autoDeleteOption, now)
 
-    const putObject = new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      ContentType: contentType,
-      Metadata: metadata,
-    })
+      const contentType = resolveContentType(fileType)
+      const metadata = buildObjectMetadata({
+        autoDeleteOption,
+        expiresAtDate,
+        now,
+        filenameMode,
+        originalFilename: fileName,
+      })
 
-    const uploadUrl = await getSignedUrl(s3Client, putObject, {
-      // Increase the TTL to give S3 presigned URLs breathing room when the hosting
-      // environment's clock drifts slightly behind AWS. A shorter 15 minute window
-      // led to immediate expirations in production due to clock skew.
-      expiresIn: UPLOAD_URL_TTL_SECONDS,
-    })
+      const requiredHeaders = buildRequiredHeaders({ contentType, metadata })
+
+      const putObject = new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        ContentType: contentType,
+        Metadata: metadata,
+      })
+
+      const uploadUrl = await getSignedUrl(s3Client, putObject, {
+        // Increase the TTL to give S3 presigned URLs breathing room when the hosting
+        // environment's clock drifts slightly behind AWS. A shorter 15 minute window
+        // led to immediate expirations in production due to clock skew.
+        expiresIn: UPLOAD_URL_TTL_SECONDS,
+        signingRegion: s3Region,
+      })
+
+      maybeLogPresignDebug({
+        method: PRESIGNED_HTTP_METHOD,
+        presignedUrl: uploadUrl,
+        requiredHeaders,
+      })
 
     const payload = {
       uploadUrl,
-      requiredHeaders: buildRequiredHeaders({ contentType, metadata }),
+        requiredHeaders,
       key,
       url: getPublicFileUrl(key),
       sharePath,
@@ -150,7 +162,9 @@ function buildRequiredHeaders({ contentType, metadata }: RequiredHeadersParams):
     "Content-Type": contentType,
   }
 
-  for (const [key, value] of Object.entries(metadata)) {
+  const metadataEntries = Object.entries(metadata).sort(([a], [b]) => a.localeCompare(b))
+
+  for (const [key, value] of metadataEntries) {
     headers[`x-amz-meta-${key}`] = value
   }
 
@@ -302,4 +316,152 @@ function isNotFoundError(error: unknown): boolean {
 
   const name = serviceError.name?.toLowerCase()
   return name === "nosuchkey" || name === "notfound"
+}
+
+async function ensureS3ClientRegion(s3Client: ReturnType<typeof getS3Client>, expectedRegion: string): Promise<void> {
+  try {
+    const regionConfig = s3Client.config.region
+    if (!regionConfig) {
+      console.warn(`[s3:presign] S3 client is missing a region configuration. Expected "${expectedRegion}".`)
+      return
+    }
+
+    const resolvedRegion = typeof regionConfig === "function" ? await regionConfig() : regionConfig
+    if (!resolvedRegion) {
+      console.warn(`[s3:presign] Unable to resolve S3 client region. Expected "${expectedRegion}".`)
+      return
+    }
+
+    const trimmed = resolvedRegion.trim()
+    if (trimmed.length === 0) {
+      console.warn(`[s3:presign] Resolved S3 client region was empty. Expected "${expectedRegion}".`)
+      return
+    }
+
+    if (trimmed !== expectedRegion) {
+      console.warn(`[s3:presign] S3 client region "${trimmed}" does not match expected bucket region "${expectedRegion}". Using the expected region for presigning.`)
+    }
+  } catch (error) {
+    console.warn("[s3:presign] Failed to verify S3 client region.", error)
+  }
+}
+
+type PresignDebugContext = {
+  method: string
+  presignedUrl: string
+  requiredHeaders: Record<string, string>
+}
+
+const PRESIGN_DEBUG_ENV_VARS = ["AWS_PRESIGN_DEBUG", "LOG_AWS_PRESIGN", "LOG_S3_PRESIGN", "LOG_CANONICAL_REQUEST"] as const
+
+function maybeLogPresignDebug(context: PresignDebugContext): void {
+  if (!shouldLogPresignDebug()) return
+
+  try {
+    const { canonicalRequest, stringToSign } = buildPresignDebugArtifacts(context)
+    console.info(`[s3:presign] CanonicalRequest\n${canonicalRequest}`)
+    console.info(`[s3:presign] StringToSign\n${stringToSign}`)
+  } catch (error) {
+    console.error("[s3:presign] Failed to compute presign debug details.", error)
+  }
+}
+
+function shouldLogPresignDebug(): boolean {
+  for (const name of PRESIGN_DEBUG_ENV_VARS) {
+    const value = process.env[name]
+    if (!value) continue
+
+    const normalized = value.trim().toLowerCase()
+    if (normalized === "1" || normalized === "true" || normalized === "yes") {
+      return true
+    }
+  }
+
+  return false
+}
+
+function buildPresignDebugArtifacts({ method, presignedUrl, requiredHeaders }: PresignDebugContext) {
+  const url = new URL(presignedUrl)
+  const canonicalUri = url.pathname
+
+  const encodedParams = Array.from(url.searchParams.entries()).map(([key, value]) => [encodeRfc3986(key), encodeRfc3986(value)] as const)
+  encodedParams.sort((a, b) => {
+    if (a[0] === b[0]) {
+      return a[1].localeCompare(b[1])
+    }
+    return a[0].localeCompare(b[0])
+  })
+  const canonicalQueryString = encodedParams.map(([key, value]) => `${key}=${value}`).join("&")
+
+  const signedHeadersParam = url.searchParams.get("X-Amz-SignedHeaders")
+  if (!signedHeadersParam) {
+    throw new Error("Presigned URL is missing the X-Amz-SignedHeaders parameter.")
+  }
+
+  const signedHeaders = signedHeadersParam
+    .split(";")
+    .map((header) => header.trim().toLowerCase())
+    .filter((header) => header.length > 0)
+
+  const normalizedHeaders = normalizeHeaderMap(requiredHeaders)
+  const securityToken = url.searchParams.get("X-Amz-Security-Token")
+  if (securityToken) {
+    normalizedHeaders["x-amz-security-token"] = canonicalizeHeaderValue(securityToken)
+  }
+
+  const canonicalHeaders = signedHeaders
+    .map((headerName) => {
+      let value: string | undefined
+
+      switch (headerName) {
+        case "host":
+          value = url.host
+          break
+        case "x-amz-content-sha256":
+          value = url.searchParams.get("X-Amz-Content-Sha256") ?? url.searchParams.get("X-Amz-Content-SHA256") ?? "UNSIGNED-PAYLOAD"
+          break
+        case "x-amz-date":
+          value = url.searchParams.get("X-Amz-Date") ?? ""
+          break
+        default:
+          value = normalizedHeaders[headerName]
+      }
+
+      if (value === undefined) {
+        throw new Error(`Missing value for signed header "${headerName}".`)
+      }
+
+      return `${headerName}:${canonicalizeHeaderValue(value)}\n`
+    })
+    .join("")
+
+  const payloadHash = url.searchParams.get("X-Amz-Content-Sha256") ?? url.searchParams.get("X-Amz-Content-SHA256") ?? "UNSIGNED-PAYLOAD"
+
+  const canonicalRequest = `${method.toUpperCase()}\n${canonicalUri}\n${canonicalQueryString}\n${canonicalHeaders}\n${signedHeadersParam}\n${payloadHash}`
+
+  const amzDate = url.searchParams.get("X-Amz-Date") ?? ""
+  const credential = url.searchParams.get("X-Amz-Credential") ?? ""
+  const credentialScope = credential.includes("/") ? credential.split("/").slice(1).join("/") : ""
+  const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${sha256Hex(canonicalRequest)}`
+
+  return { canonicalRequest, stringToSign }
+}
+
+function normalizeHeaderMap(headers: Record<string, string>): Record<string, string> {
+  return Object.entries(headers).reduce<Record<string, string>>((acc, [key, value]) => {
+    acc[key.toLowerCase()] = canonicalizeHeaderValue(value)
+    return acc
+  }, {})
+}
+
+function canonicalizeHeaderValue(value: string): string {
+  return value.replace(/\s+/g, " ").trim()
+}
+
+function encodeRfc3986(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex")
 }
