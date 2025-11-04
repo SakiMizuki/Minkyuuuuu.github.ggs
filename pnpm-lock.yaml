@@ -11,6 +11,9 @@ importers:
       '@aws-sdk/client-s3':
         specifier: ^3.922.0
         version: 3.922.0
+      '@aws-sdk/middleware-flexible-checksums':
+        specifier: ^3.922.0
+        version: 3.922.0
       '@aws-sdk/s3-request-presigner':
         specifier: ^3.922.0
         version: 3.922.0
