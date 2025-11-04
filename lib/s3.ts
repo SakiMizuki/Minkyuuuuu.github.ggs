@@ -1,4 +1,5 @@
 import { S3Client } from "@aws-sdk/client-s3"
+import { RequestChecksumCalculation } from "@aws-sdk/middleware-flexible-checksums"
 
 type S3Config = {
   region: string
@@ -43,6 +44,7 @@ export function getS3Client(): S3Client {
       accessKeyId: config.accessKeyId,
       secretAccessKey: config.secretAccessKey,
     },
+    requestChecksumCalculation: RequestChecksumCalculation.WHEN_REQUIRED,
   })
 
   return client
