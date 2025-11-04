@@ -13,6 +13,7 @@ type FilenameMode = "original" | "random"
 
 const MAX_FILENAME_LENGTH = 200
 const DEFAULT_FILENAME_MODE: FilenameMode = "random"
+const UPLOAD_URL_TTL_SECONDS = 60 * 60 // 1 hour
 
 export async function POST(request: NextRequest) {
   try {
@@ -63,7 +64,10 @@ export async function POST(request: NextRequest) {
     })
 
     const uploadUrl = await getSignedUrl(s3Client, putObject, {
-      expiresIn: 60 * 15,
+      // Increase the TTL to give S3 presigned URLs breathing room when the hosting
+      // environment's clock drifts slightly behind AWS. A shorter 15 minute window
+      // led to immediate expirations in production due to clock skew.
+      expiresIn: UPLOAD_URL_TTL_SECONDS,
     })
 
     const payload = {
